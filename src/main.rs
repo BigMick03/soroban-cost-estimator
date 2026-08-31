@@ -142,7 +142,11 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             args,
             cache_ttl,
             json,
+            auto_snapshot,
         } => {
+            if auto_snapshot {
+                take_auto_snapshot(&network, json, rps).await?;
+            }
             cmd_estimate(
                 &wasm,
                 &network,
@@ -161,7 +165,13 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             network,
             id,
             json,
-        } => cmd_estimate_all(&wasm, &network, id.as_deref(), json, rps).await,
+            auto_snapshot,
+        } => {
+            if auto_snapshot {
+                take_auto_snapshot(&network, json, rps).await?;
+            }
+            cmd_estimate_all(&wasm, &network, id.as_deref(), json, rps).await
+        }
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
             cli::ConfigAction::Snapshot { network, out, json } => {
@@ -926,6 +936,50 @@ fn print_stale_estimates(network: &str, ledger: u32) {
         }
         Err(e) => {
             println!("  Warning: could not check cache: {e}");
+        }
+    }
+}
+
+/// Take a config snapshot automatically before an estimate command.
+///
+/// Errors are treated as non-fatal: a warning is printed and the estimate
+/// proceeds anyway.  This keeps the auto-snapshot from blocking the user's
+/// primary workflow while still surfacing the drift-detection intent.
+async fn take_auto_snapshot(
+    network: &str,
+    json_flag: bool,
+    rps: Option<u64>,
+) -> error::AppResult<()> {
+    if !json_flag {
+        println!("auto-snapshot: taking config snapshot before estimate…");
+    }
+    match fetch_config_snapshot(network, rps).await {
+        Ok(snapshot) => match config_snapshot::store::save_snapshot(&snapshot, None) {
+            Ok(path) => {
+                if !json_flag {
+                    println!(
+                        "auto-snapshot: saved to {} (network: {}, ledger: {})",
+                        path.display(),
+                        snapshot.network,
+                        snapshot.ledger
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error = %e, "auto-snapshot: could not save snapshot");
+                if !json_flag {
+                    eprintln!("Warning: auto-snapshot failed to save: {e}");
+                }
+                Ok(())
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "auto-snapshot: could not fetch config");
+            if !json_flag {
+                eprintln!("Warning: auto-snapshot failed: {e}");
+            }
+            Ok(())
         }
     }
 }

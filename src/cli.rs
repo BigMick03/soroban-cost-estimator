@@ -53,6 +53,11 @@ pub enum Command {
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Automatically snapshot network config before estimating,
+        /// enabling implicit drift detection.
+        #[arg(long)]
+        auto_snapshot: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -72,6 +77,11 @@ pub enum Command {
         /// Output as JSON instead of a human-readable list.
         #[arg(long)]
         json: bool,
+
+        /// Automatically snapshot network config before estimating,
+        /// enabling implicit drift detection.
+        #[arg(long)]
+        auto_snapshot: bool,
     },
 
     /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.
