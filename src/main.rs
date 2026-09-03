@@ -146,7 +146,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cache_ttl,
             json,
             format,
-            auto_snapshot,
+            precision,
         } => {
             // `--format` wins when both it and the legacy `--json` flag are
             // supplied; otherwise fall back to the JSON/table defaults.
@@ -165,6 +165,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 &format,
                 rps,
                 timeout,
+                precision,
             )
             .await
         }
@@ -174,13 +175,19 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             id,
             json,
             format,
-            auto_snapshot,
+            precision,
         } => {
             let format = format.unwrap_or_else(|| if json { "json" } else { "table" }.to_string());
-            if auto_snapshot {
-                take_auto_snapshot(&network, format != "table", rps, timeout).await?;
-            }
-            cmd_estimate_all(&wasm, &network, id.as_deref(), &format, rps, timeout).await
+            cmd_estimate_all(
+                &wasm,
+                &network,
+                id.as_deref(),
+                &format,
+                rps,
+                timeout,
+                precision,
+            )
+            .await
         }
         cli::Command::WasmInfo { wasm, json } => cmd_wasm_info(&wasm, json),
         cli::Command::Config { action } => match action {
@@ -391,6 +398,7 @@ async fn cmd_estimate(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    precision: u32,
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -428,7 +436,7 @@ async fn cmd_estimate(
         {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
-            print_cached_estimate(&fresh, ttl_secs, json_flag);
+            print_cached_estimate(&fresh, ttl_secs, json_flag, precision);
             return Ok(());
         }
 
@@ -493,6 +501,7 @@ async fn cmd_estimate(
             read_bytes,
             tx_xdr.len() as u32,
             fee_rates,
+            precision,
         );
 
         let report = report::cost_report::CostReport {
@@ -577,6 +586,7 @@ async fn cmd_estimate_all(
     format: &str,
     rps: Option<u64>,
     timeout: u64,
+    precision: u32,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -656,6 +666,7 @@ async fn cmd_estimate_all(
                 network,
                 json_flag,
                 fee_rates.as_ref(),
+                precision,
             )
             .await?;
             if format == "csv" {
@@ -695,7 +706,7 @@ async fn cmd_estimate_all(
             .iter()
             .filter_map(|r| r.fee.as_ref().map(|f| f.total_stroops))
             .collect();
-        emit_fee_range_summary(&fees, format == "json");
+        emit_fee_range_summary(&fees, format == "json", precision);
 
         if format == "json" {
             println!("{}", serde_json::to_string_pretty(&json_results)?);
@@ -717,7 +728,7 @@ async fn cmd_estimate_all(
 /// In human mode it is printed as three lines. The fee range is intentionally
 /// omitted from the structured JSON array (which already contains a per-function
 /// `fee` record); callers can derive min/max/average from those records.
-fn emit_fee_range_summary(fees: &[i64], json_flag: bool) {
+fn emit_fee_range_summary(fees: &[i64], json_flag: bool, precision: u32) {
     if json_flag {
         return;
     }
@@ -731,17 +742,17 @@ fn emit_fee_range_summary(fees: &[i64], json_flag: bool) {
     println!(
         "  min: {} stroops ({})",
         range.min_stroops,
-        report::fee_calc::stroops_to_xlm(range.min_stroops)
+        report::fee_calc::stroops_to_xlm(range.min_stroops, precision)
     );
     println!(
         "  max: {} stroops ({})",
         range.max_stroops,
-        report::fee_calc::stroops_to_xlm(range.max_stroops)
+        report::fee_calc::stroops_to_xlm(range.max_stroops, precision)
     );
     println!(
         "  avg: {} stroops ({})",
         range.avg_stroops,
-        report::fee_calc::stroops_to_xlm(range.avg_stroops)
+        report::fee_calc::stroops_to_xlm(range.avg_stroops, precision)
     );
 }
 
@@ -760,6 +771,7 @@ async fn estimate_all_function(
     network: &str,
     json_flag: bool,
     fee_rates: Option<&report::fee_calc::FeeRates>,
+    precision: u32,
 ) -> error::AppResult<EstimateAllResult> {
     use tracing::{Instrument, debug, info_span};
 
@@ -814,7 +826,7 @@ async fn estimate_all_function(
                         &resp.transaction_data,
                     )?)
                     .unwrap_or(0);
-                let xlm = report::fee_calc::stroops_to_xlm(total_fee);
+                let xlm = report::fee_calc::stroops_to_xlm(total_fee, precision);
                 let ledger: u32 = resp
                     .latest_ledger
                     .and_then(|l| u32::try_from(l).ok())
@@ -847,6 +859,7 @@ async fn estimate_all_function(
                         read_bytes,
                         tx_xdr.len() as u32,
                         *rates,
+                        precision,
                     ),
                     None => report::fee_calc::FeeBreakdown {
                         non_refundable_stroops: 0,
@@ -1248,7 +1261,12 @@ fn fresh_cached_estimate(
 ///
 /// # Network calls
 /// None — pure output.
-fn print_cached_estimate(fresh: &cache::CachedEstimate, ttl_secs: u64, json_flag: bool) {
+fn print_cached_estimate(
+    fresh: &cache::CachedEstimate,
+    ttl_secs: u64,
+    json_flag: bool,
+    precision: u32,
+) {
     if json_flag {
         println!(
             "{}",
@@ -1270,7 +1288,7 @@ fn print_cached_estimate(fresh: &cache::CachedEstimate, ttl_secs: u64, json_flag
         println!(
             "  Total fee: {} stroops ({} XLM) | CPU: {} insns | Mem: {} bytes | Ledger: {}",
             fresh.total_stroops,
-            report::fee_calc::stroops_to_xlm(fresh.total_stroops),
+            report::fee_calc::stroops_to_xlm(fresh.total_stroops, precision),
             fresh.cpu_instructions,
             fresh.memory_bytes,
             fresh.ledger,
@@ -1539,7 +1557,7 @@ async fn cmd_cache_warm(
     timeout: u64,
 ) -> error::AppResult<()> {
     let fmt = if json_flag { "json" } else { "table" };
-    cmd_estimate_all(wasm_path, network, contract_id, fmt, rps, timeout).await
+    cmd_estimate_all(wasm_path, network, contract_id, fmt, rps, timeout, 7).await
 }
 
 #[cfg(test)]
