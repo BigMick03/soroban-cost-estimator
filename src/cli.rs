@@ -63,6 +63,11 @@ pub enum Command {
         /// Overrides `--json` when both are supplied.
         #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
         format: Option<String>,
+
+        /// Automatically snapshot network config before estimating,
+        /// enabling implicit drift detection.
+        #[arg(long)]
+        auto_snapshot: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -87,6 +92,11 @@ pub enum Command {
         /// Overrides `--json` when both are supplied.
         #[arg(long, value_parser = ["table", "json", "csv", "markdown"])]
         format: Option<String>,
+
+        /// Automatically snapshot network config before estimating,
+        /// enabling implicit drift detection.
+        #[arg(long)]
+        auto_snapshot: bool,
     },
 
     /// Print WASM metadata (functions, contract spec, size, hash) without any RPC calls.
