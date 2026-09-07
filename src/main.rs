@@ -116,14 +116,16 @@ impl EstimateAllResult {
 
 #[tokio::main]
 async fn main() {
+    let args = cli::Cli::parse();
+
+    let default_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
         .init();
 
-    let args = cli::Cli::parse();
-    info!(command = ?args.command, "starting soroban-cost-estimator");
+    info!(command = ?args.command, verbose = args.verbose, "starting soroban-cost-estimator");
 
     if let Err(err) = run(args).await {
         error!(error = %err, "command failed");
@@ -138,6 +140,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
     let timeout = args.timeout;
     let max_retries = args.max_retries;
     let fallback = args.rpc_fallback_url.as_deref();
+    let headers = args.headers;
     match args.command {
         cli::Command::Estimate {
             wasm,
@@ -147,6 +150,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             id,
             args,
             cache_ttl,
+            clear_cache,
             json,
             format,
             precision,
@@ -166,17 +170,20 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 r#fn.as_deref(),
                 &args,
                 cache_ttl.as_deref(),
+                clear_cache,
                 &format,
                 rps,
                 timeout,
                 max_retries,
                 precision,
+                &headers,
             )
             .await
         }
         cli::Command::EstimateAll {
             wasm,
             network,
+            rpc_url,
             id,
             json,
             format,
@@ -186,6 +193,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cmd_estimate_all(
                 &wasm,
                 &network,
+                rpc_url.as_deref(),
                 fallback,
                 id.as_deref(),
                 &format,
@@ -193,6 +201,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 timeout,
                 max_retries,
                 precision,
+                &headers,
             )
             .await
         }
@@ -207,6 +216,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                     rps,
                     timeout,
                     max_retries,
+                    &headers,
                 )
                 .await
             }
@@ -215,15 +225,18 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 network,
                 against,
                 summary,
+                json,
             } => {
                 cmd_config_diff(
                     &network,
                     fallback,
                     against.as_deref(),
                     summary,
+                    json,
                     rps,
                     timeout,
                     max_retries,
+                    &headers,
                 )
                 .await
             }
@@ -236,22 +249,26 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             cli::CacheAction::Warm {
                 wasm,
                 network,
+                rpc_url,
                 id,
                 json,
             } => {
                 cmd_cache_warm(
                     &wasm,
                     &network,
+                    rpc_url.as_deref(),
                     fallback,
                     id.as_deref(),
                     json,
                     rps,
                     timeout,
                     max_retries,
+                    &headers,
                 )
                 .await
             }
             cli::CacheAction::Verify => cmd_cache_verify(),
+            cli::CacheAction::Clear { network } => cmd_cache_clear(&network),
             cli::CacheAction::Query {
                 network,
                 function,
@@ -273,7 +290,16 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             ),
         },
         cli::Command::Watch { network, interval } => {
-            cmd_watch(&network, fallback, &interval, rps, timeout, max_retries).await
+            cmd_watch(
+                &network,
+                fallback,
+                &interval,
+                rps,
+                timeout,
+                max_retries,
+                &headers,
+            )
+            .await
         }
     }
 }
@@ -437,11 +463,13 @@ async fn cmd_estimate(
     fn_name: Option<&str>,
     args: &[String],
     cache_ttl: Option<&str>,
+    clear_cache: bool,
     format: &str,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
     precision: u32,
+    extra_headers: &[String],
 ) -> error::AppResult<()> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -456,6 +484,21 @@ async fn cmd_estimate(
         has_contract_id = contract_id.is_some(),
     );
     async {
+        // With `--clear-cache`, wipe every cached estimate for this network
+        // before anything else runs, so the `--cache-ttl` lookup and the
+        // simulation below both start from an empty slate. Human-readable
+        // table output gets the announcement on stdout; machine formats
+        // (json/csv/markdown) keep their stdout clean and use stderr.
+        if clear_cache {
+            let cleared = cache::clear_cache(network)?;
+            let message = format!("Cleared {cleared} cached estimate(s) for {network}.");
+            if table_mode {
+                println!("{message}");
+            } else {
+                eprintln!("{message}");
+            }
+        }
+
         info!("loading WASM");
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         debug!(functions = wasm_info.functions.len(), has_spec = wasm_info.has_spec, "WASM loaded");
@@ -484,12 +527,13 @@ async fn cmd_estimate(
         }
 
         let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
-        let client = rpc::client::RpcClient::with_fallback(
+        let client = rpc::client::RpcClient::with_fallback_headers(
             &endpoint,
             rpc_fallback_url,
             rps,
             std::time::Duration::from_secs(timeout),
             max_retries,
+            extra_headers,
         );
 
         let sc_vals: Vec<stellar_xdr::ScVal> = args
@@ -506,6 +550,12 @@ async fn cmd_estimate(
 
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_xdr);
         debug!(tx_xdr_len = tx_xdr.len(), "built simulation tx envelope");
+
+        // Fail fast on a misconfigured --rpc-url or down node (#55): validate
+        // the endpoint is reachable and healthy before running any simulation.
+        // Local argument errors above are reported first; this guards the
+        // (potentially expensive) simulateTransaction call itself.
+        client.health_check().await?;
 
         // Time the simulateTransaction round-trip so the report can flag
         // slow RPC endpoints. Includes any retries performed by the client.
@@ -627,6 +677,7 @@ fn csv_row(r: &EstimateAllResult) -> String {
 async fn cmd_estimate_all(
     wasm_path: &str,
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     format: &str,
@@ -634,6 +685,7 @@ async fn cmd_estimate_all(
     timeout: u64,
     max_retries: usize,
     precision: u32,
+    extra_headers: &[String],
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -679,14 +731,20 @@ async fn cmd_estimate_all(
             }
         }
 
-        let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::with_fallback(
+        let endpoint = rpc::client::resolve_endpoint(network, rpc_url)?;
+        let client = rpc::client::RpcClient::with_fallback_headers(
             &endpoint,
             rpc_fallback_url,
             rps,
             std::time::Duration::from_secs(timeout),
             max_retries,
+            extra_headers,
         );
+
+        // Validate the RPC endpoint is reachable before running a full batch
+        // of simulations (#55): fail fast up front rather than after each
+        // function's simulation times out.
+        client.health_check().await?;
 
         // Fee rates are only needed to itemize the per-function fee breakdown
         // in JSON output; skip the extra RPC calls in table mode.
@@ -1045,6 +1103,7 @@ async fn fetch_config_snapshot(
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
+    extra_headers: &[String],
 ) -> error::AppResult<config_snapshot::model::ConfigSnapshot> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1052,12 +1111,13 @@ async fn fetch_config_snapshot(
     let span = info_span!("fetch_config_snapshot", network);
     async {
         let endpoint = rpc::client::resolve_endpoint(network, None)?;
-        let client = rpc::client::RpcClient::with_fallback(
+        let client = rpc::client::RpcClient::with_fallback_headers(
             &endpoint,
             rpc_fallback_url,
             rps,
             std::time::Duration::from_secs(timeout),
             max_retries,
+            extra_headers,
         );
         debug!("fetching all config settings");
         let raw_entries = rpc::config::fetch_all_config_settings(&client).await?;
@@ -1160,6 +1220,7 @@ async fn cmd_config_snapshot(
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
+    extra_headers: &[String],
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
@@ -1167,8 +1228,15 @@ async fn cmd_config_snapshot(
     let span = info_span!("cmd_config_snapshot", network);
     async {
         info!("taking config snapshot");
-        let snapshot =
-            fetch_config_snapshot(network, rpc_fallback_url, rps, timeout, max_retries).await?;
+        let snapshot = fetch_config_snapshot(
+            network,
+            rpc_fallback_url,
+            rps,
+            timeout,
+            max_retries,
+            extra_headers,
+        )
+        .await?;
 
         let path = config_snapshot::store::save_snapshot(&snapshot, out_path)?;
         info!(path = %path.display(), ledger = snapshot.ledger, "snapshot saved");
@@ -1223,9 +1291,11 @@ async fn cmd_config_diff(
     rpc_fallback_url: Option<&str>,
     against_path: Option<&str>,
     summary: bool,
+    json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
+    extra_headers: &[String],
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -1243,8 +1313,15 @@ async fn cmd_config_diff(
             }
         };
 
-        let new_snapshot =
-            fetch_config_snapshot(network, rpc_fallback_url, rps, timeout, max_retries).await?;
+        let new_snapshot = fetch_config_snapshot(
+            network,
+            rpc_fallback_url,
+            rps,
+            timeout,
+            max_retries,
+            extra_headers,
+        )
+        .await?;
 
         let diff = config_snapshot::diff::diff_snapshots(&old_snapshot, &new_snapshot);
         debug!(
@@ -1252,7 +1329,23 @@ async fn cmd_config_diff(
             has_pricing = diff.has_pricing_changes,
             "diff computed"
         );
-        if summary {
+
+        if json_flag {
+            // Collect stale estimates for inclusion in JSON output.
+            let stale: Vec<cache::CachedEstimate> = cache::list_cached_estimates(network)
+                .map(|estimates| {
+                    cache::find_stale_estimates(&estimates, new_snapshot.ledger)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let json_output = serde_json::json!({
+                "diff": diff,
+                "stale_estimates": stale,
+            });
+            println!("{}", serde_json::to_string_pretty(&json_output)?);
+        } else if summary {
             println!("{}", config_snapshot::diff::format_diff_summary(&diff));
         } else {
             println!("{}", config_snapshot::diff::format_diff(&diff));
@@ -1262,7 +1355,7 @@ async fn cmd_config_diff(
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
-                    if !summary {
+                    if !json_flag && !summary {
                         println!(
                             "  Protocol upgrade detected — new config auto-saved to {}",
                             path.display()
@@ -1271,14 +1364,14 @@ async fn cmd_config_diff(
                 }
                 Err(e) => {
                     warn!(error = %e, "could not auto-save post-upgrade snapshot");
-                    if !summary {
+                    if !json_flag && !summary {
                         eprintln!("  Warning: could not auto-save post-upgrade snapshot: {e}");
                     }
                 }
             }
         }
 
-        if !summary {
+        if !json_flag && !summary {
             print_stale_estimates(network, new_snapshot.ledger);
         }
 
@@ -1457,10 +1550,21 @@ async fn watch_poll_once(
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
+    extra_headers: &[String],
 ) -> error::AppResult<()> {
     use tracing::{debug, warn};
 
-    match fetch_config_snapshot(network, rpc_fallback_url, rps, timeout, max_retries).await {
+    let snapshot_result = fetch_config_snapshot(
+        network,
+        rpc_fallback_url,
+        rps,
+        timeout,
+        max_retries,
+        extra_headers,
+    )
+    .await;
+
+    match snapshot_result {
         Ok(snapshot) => {
             if !*first {
                 if let Ok(old_snapshot) = config_snapshot::store::load_latest_snapshot(network) {
@@ -1497,6 +1601,7 @@ async fn cmd_watch(
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
+    extra_headers: &[String],
 ) -> error::AppResult<()> {
     use tracing::info;
 
@@ -1525,6 +1630,7 @@ async fn cmd_watch(
                     rps,
                     timeout,
                     max_retries,
+                    extra_headers,
                 )
                 .await;
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
@@ -1632,6 +1738,20 @@ fn cmd_cache_verify() -> error::AppResult<()> {
     Ok(())
 }
 
+/// `cache clear` command: delete every cached estimate for a network.
+///
+/// Defaults to `testnet`; pass `--network` to target another network. Only
+/// entries recorded for that network are removed — other networks' entries
+/// are untouched.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+fn cmd_cache_clear(network: &str) -> error::AppResult<()> {
+    let cleared = cache::clear_cache(network)?;
+    println!("Cleared {cleared} cached estimate(s) for {network}.");
+    Ok(())
+}
+
 /// `cache query` command: list cached estimates matching the given filters.
 ///
 /// Prints a table (or JSON when `--json` is passed). An empty result prints a
@@ -1723,17 +1843,20 @@ fn cmd_cache_export(out_path: Option<&str>) -> error::AppResult<()> {
 async fn cmd_cache_warm(
     wasm_path: &str,
     network: &str,
+    rpc_url: Option<&str>,
     rpc_fallback_url: Option<&str>,
     contract_id: Option<&str>,
     json_flag: bool,
     rps: Option<u64>,
     timeout: u64,
     max_retries: usize,
+    extra_headers: &[String],
 ) -> error::AppResult<()> {
     let fmt = if json_flag { "json" } else { "table" };
     cmd_estimate_all(
         wasm_path,
         network,
+        rpc_url,
         rpc_fallback_url,
         contract_id,
         fmt,
@@ -1741,6 +1864,7 @@ async fn cmd_cache_warm(
         timeout,
         max_retries,
         7,
+        extra_headers,
     )
     .await
 }
